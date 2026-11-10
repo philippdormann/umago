@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <meta name="color-scheme" content="light dark" />
+    <title>Umago</title>
+    <script>
+      // Dark mode follows the OS; ModeWatcher keeps it in sync afterwards.
+      try { if (matchMedia('(prefers-color-scheme: dark)').matches) document.documentElement.classList.add('dark') } catch (e) {}
+      try { localStorage.removeItem('up-theme') } catch (e) {}
+    </script>
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#FDFDFE" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#131419" />
+    <!-- Black mark for light mode, white mark for dark mode. -->
+    <link rel="icon" type="image/png" href="/umago-transparent-black-font.png" />
+    <link rel="icon" type="image/png" media="(prefers-color-scheme: light)" href="/umago-transparent-black-font.png" />
+    <link rel="icon" type="image/png" media="(prefers-color-scheme: dark)" href="/umago-transparent-white-font.png" />
+    <!-- iOS renders transparent icons on black, so the white mark stays visible. -->
+    <link rel="apple-touch-icon" href="/umago-transparent-white-font.png" />
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,852 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Umago API",
+    "version": "1.0.0",
+    "description": "Self-hosted, cookieless web analytics. Public ingest endpoints need no auth and always answer 202. Admin endpoints need the session cookie (POST /api/v1/auth/login), HTTP Basic, or a bearer API key (umago_key_…). MCP tokens (umago_tok_…) and UMAGO_MCP_TOKEN are read-only: GET only. Public share links grant read-only access to one site's GET endpoints via ?share=<slug>. Errors are {error, message}.",
+    "license": { "name": "MIT" }
+  },
+  "servers": [{ "url": "/" }],
+  "tags": [
+    { "name": "public", "description": "No auth. Ingest always answers 202 so site ids cannot be probed." },
+    { "name": "auth", "description": "Session login, logout and TOTP two-factor." },
+    { "name": "sites", "description": "Websites and their analytics." },
+    { "name": "analytics", "description": "Stats, breakdowns, events, vitals, sessions, funnels, journeys." },
+    { "name": "integrations", "description": "Google Search Console, Polar revenue, links, shares." },
+    { "name": "admin", "description": "Status, settings, tokens, keys, users, teams, export." },
+    { "name": "mcp", "description": "Read-only Model Context Protocol endpoint (Streamable HTTP)." }
+  ],
+  "paths": {
+    "/health": {
+      "get": {
+        "tags": ["public"],
+        "summary": "Health check",
+        "security": [],
+        "responses": {
+          "200": { "description": "ok", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } } },
+          "503": { "description": "degraded", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } } }
+        }
+      }
+    },
+    "/umago.js": {
+      "get": {
+        "tags": ["public"],
+        "summary": "Tracking snippet",
+        "description": "The ~1KB cookieless snippet. Served from every UMAGO_SCRIPT_NAMES alias (default umago.js), cached for a day, deriving /api/v1/collect from its own URL unless data-host-url is set.",
+        "security": [],
+        "responses": { "200": { "description": "JavaScript snippet", "content": { "application/javascript": { "schema": { "type": "string" } } } } }
+      }
+    },
+    "/api/v1/theme": {
+      "get": {
+        "tags": ["public"],
+        "summary": "Public theme",
+        "security": [],
+        "responses": { "200": { "description": "accent, title and canonical script_name (first UMAGO_SCRIPT_NAMES entry)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Theme" } } } } }
+      }
+    },
+    "/api/v1/collect": {
+      "post": {
+        "tags": ["public"],
+        "summary": "Ingest one event",
+        "description": "Always 202. Drops bots, DNT: 1, host mismatches and oversize bodies quietly.",
+        "security": [],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CollectBody" } } } },
+        "responses": { "202": { "description": "accepted (also on invalid events)" } }
+      }
+    },
+    "/api/v1/batch": {
+      "post": {
+        "tags": ["public"],
+        "summary": "Ingest up to 50 events",
+        "security": [],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["events"], "properties": { "events": { "type": "array", "maxItems": 50, "items": { "$ref": "#/components/schemas/CollectBody" } } } } } } },
+        "responses": { "202": { "description": "accepted" } }
+      }
+    },
+    "/l/{slug}": {
+      "get": {
+        "tags": ["public"],
+        "summary": "Short link redirect",
+        "description": "Records a link click event, 302s to the target.",
+        "security": [],
+        "parameters": [{ "$ref": "#/components/parameters/Slug" }],
+        "responses": { "302": { "description": "redirect" }, "404": { "description": "no such link", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } } }
+      }
+    },
+    "/p/{slug}": {
+      "get": {
+        "tags": ["public"],
+        "summary": "Tracking pixel",
+        "description": "Records a pixel hit, serves a 1px gif.",
+        "security": [],
+        "parameters": [{ "$ref": "#/components/parameters/Slug" }],
+        "responses": { "200": { "description": "1px gif", "content": { "image/gif": { "schema": { "type": "string", "format": "binary" } } } }, "404": { "description": "no such pixel", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } } }
+      }
+    },
+    "/api/v1/auth/me": {
+      "get": {
+        "tags": ["auth"],
+        "summary": "Current auth state",
+        "security": [],
+        "responses": { "200": { "description": "auth state", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuthState" } } } } }
+      }
+    },
+    "/api/v1/auth/login": {
+      "post": {
+        "tags": ["auth"],
+        "summary": "Sign in",
+        "description": "Sets the umago_session cookie. 2FA accounts get {requires_2fa, challenge} instead; redeem via /auth/2fa/verify.",
+        "security": [],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["username", "password"], "properties": { "username": { "type": "string" }, "password": { "type": "string" } } } } } },
+        "responses": {
+          "200": { "description": "signed in or 2FA challenge", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuthState" } } } },
+          "401": { "description": "bad credentials", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/v1/auth/logout": {
+      "post": {
+        "tags": ["auth"],
+        "summary": "Sign out",
+        "security": [],
+        "responses": { "204": { "description": "signed out" } }
+      }
+    },
+    "/api/v1/auth/2fa/verify": {
+      "post": {
+        "tags": ["auth"],
+        "summary": "Redeem a 2FA login challenge",
+        "security": [],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["token", "code"], "properties": { "token": { "type": "string" }, "code": { "type": "string", "description": "TOTP or backup code" } } } } } },
+        "responses": {
+          "200": { "description": "signed in", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/AuthState" } } } },
+          "401": { "description": "wrong code", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/v1/auth/2fa/status": {
+      "get": {
+        "tags": ["auth"],
+        "summary": "Own TOTP status",
+        "responses": { "200": { "description": "status", "content": { "application/json": { "schema": { "type": "object", "properties": { "enabled": { "type": "boolean" } } } } } } }
+      }
+    },
+    "/api/v1/auth/2fa/setup": {
+      "post": {
+        "tags": ["auth"],
+        "summary": "Start TOTP setup",
+        "responses": { "200": { "description": "secret, otpauth url and QR data URL", "content": { "application/json": { "schema": { "type": "object", "properties": { "secret": { "type": "string" }, "otpauth_url": { "type": "string" }, "qr": { "type": "string" } } } } } } }
+      }
+    },
+    "/api/v1/auth/2fa/confirm": {
+      "post": {
+        "tags": ["auth"],
+        "summary": "Confirm TOTP setup",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["code"], "properties": { "code": { "type": "string" } } } } } },
+        "responses": { "200": { "description": "enabled plus backup codes", "content": { "application/json": { "schema": { "type": "object", "properties": { "enabled": { "type": "boolean" }, "backup_codes": { "type": "array", "items": { "type": "string" } } } } } } } }
+      }
+    },
+    "/api/v1/auth/2fa/disable": {
+      "post": {
+        "tags": ["auth"],
+        "summary": "Disable own TOTP",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["password"], "properties": { "password": { "type": "string" } } } } } },
+        "responses": { "200": { "description": "disabled", "content": { "application/json": { "schema": { "type": "object", "properties": { "enabled": { "type": "boolean" } } } } } } }
+      }
+    },
+    "/api/v1/share/{slug}": {
+      "get": {
+        "tags": ["sites"],
+        "summary": "Public dashboard data for a share link",
+        "security": [],
+        "parameters": [{ "$ref": "#/components/parameters/ShareSlug" }],
+        "responses": {
+          "200": { "description": "site, live count and stats", "content": { "application/json": { "schema": { "type": "object", "properties": { "site": { "type": "object" }, "live": { "type": "integer" }, "stats": { "$ref": "#/components/schemas/Summary" } } } } } },
+          "404": { "description": "no such share", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/v1/sites": {
+      "get": {
+        "tags": ["sites"],
+        "summary": "List sites with 7-day cards and live counts",
+        "responses": { "200": { "description": "sites", "content": { "application/json": { "schema": { "type": "object", "properties": { "sites": { "type": "array", "items": { "$ref": "#/components/schemas/Site" } } } } } } } }
+      },
+      "post": {
+        "tags": ["sites"],
+        "summary": "Create a site",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["domain"], "properties": { "name": { "type": "string" }, "domain": { "type": "string" }, "owner_team_id": { "type": "string", "description": "admins only" } } } } } },
+        "responses": {
+          "201": { "description": "created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Site" } } } },
+          "422": { "description": "invalid", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/v1/sites/reorder": {
+      "post": {
+        "tags": ["sites"],
+        "summary": "Reorder sites",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["ids"], "properties": { "ids": { "type": "array", "items": { "type": "string" } } } } } } },
+        "responses": { "200": { "description": "sites in display order", "content": { "application/json": { "schema": { "type": "object", "properties": { "sites": { "type": "array", "items": { "$ref": "#/components/schemas/Site" } } } } } } } }
+      }
+    },
+    "/api/v1/sites/{id}": {
+      "get": {
+        "tags": ["sites"],
+        "summary": "Get a site",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }, { "$ref": "#/components/parameters/ShareQuery" }],
+        "responses": {
+          "200": { "description": "site", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Site" } } } } ,
+          "404": { "description": "not found", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      },
+      "patch": {
+        "tags": ["sites"],
+        "summary": "Update a site",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/SitePatch" } } } },
+        "responses": {
+          "200": { "description": "updated", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Site" } } } } ,
+          "422": { "description": "invalid", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      },
+      "delete": {
+        "tags": ["sites"],
+        "summary": "Delete a site and all its data",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "responses": { "204": { "description": "deleted" } }
+      }
+    },
+    "/api/v1/sites/{id}/stats": {
+      "get": {
+        "tags": ["analytics"],
+        "summary": "Dashboard summary",
+        "description": "Totals, previous window, series and top-10 breakdowns. Empty range uses the site's default. compare=prev overlays the previous window. Any dim query param filters to matching visitors (raw events, retention-limited).",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }, { "$ref": "#/components/parameters/Range" }, { "$ref": "#/components/parameters/From" }, { "$ref": "#/components/parameters/To" }, { "$ref": "#/components/parameters/Compare" }, { "$ref": "#/components/parameters/ShareQuery" }],
+        "responses": {
+          "200": { "description": "site, live count and summary", "content": { "application/json": { "schema": { "type": "object", "properties": { "site": { "$ref": "#/components/schemas/Site" }, "live": { "type": "integer" }, "stats": { "$ref": "#/components/schemas/Summary" } } } } } } ,
+          "400": { "description": "bad range", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/v1/sites/{id}/breakdown": {
+      "get": {
+        "tags": ["analytics"],
+        "summary": "Full breakdown for one dimension",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }, { "$ref": "#/components/parameters/Dim" }, { "$ref": "#/components/parameters/Range" }, { "$ref": "#/components/parameters/From" }, { "$ref": "#/components/parameters/To" }, { "$ref": "#/components/parameters/Limit500" }, { "$ref": "#/components/parameters/ShareQuery" }],
+        "responses": {
+          "200": { "description": "rows best first", "content": { "application/json": { "schema": { "type": "object", "properties": { "dim": { "type": "string" }, "range": { "type": "string" }, "rows": { "type": "array", "items": { "$ref": "#/components/schemas/Row" } } } } } } },
+          "400": { "description": "bad dim or range", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/v1/sites/{id}/live": {
+      "get": {
+        "tags": ["analytics"],
+        "summary": "Realtime snapshot",
+        "description": "Last 5 minutes by country plus per-minute visitors for the last 30 minutes, recent hits and top live pages.",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "responses": { "200": { "description": "live snapshot", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Live" } } } } }
+      }
+    },
+    "/api/v1/sites/{id}/favicon": {
+      "get": {
+        "tags": ["sites"],
+        "summary": "Stored site icon",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "responses": { "200": { "description": "icon bytes" }, "404": { "description": "none stored" } }
+      }
+    },
+    "/api/v1/sites/{id}/refresh-favicon": {
+      "post": {
+        "tags": ["sites"],
+        "summary": "Refetch the site icon now",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "responses": { "200": { "description": "site", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Site" } } } } }
+      }
+    },
+    "/api/v1/sites/{id}/event-data": {
+      "get": {
+        "tags": ["analytics"],
+        "summary": "Custom event property keys, then top values",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }, { "name": "event", "in": "query", "required": true, "schema": { "type": "string" } }, { "name": "key", "in": "query", "schema": { "type": "string" } }, { "$ref": "#/components/parameters/Range" }, { "$ref": "#/components/parameters/From" }, { "$ref": "#/components/parameters/To" }],
+        "responses": { "200": { "description": "keys or values", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/api/v1/sites/{id}/vitals": {
+      "get": {
+        "tags": ["analytics"],
+        "summary": "Web Vitals percentiles and slowest paths",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }, { "$ref": "#/components/parameters/Range" }, { "$ref": "#/components/parameters/From" }, { "$ref": "#/components/parameters/To" }],
+        "responses": { "200": { "description": "vitals report", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/api/v1/sites/{id}/sessions": {
+      "get": {
+        "tags": ["analytics"],
+        "summary": "Recent visits",
+        "description": "Reads raw events, limited by retention. limit 1-500, default 100.",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }, { "$ref": "#/components/parameters/Range" }, { "$ref": "#/components/parameters/From" }, { "$ref": "#/components/parameters/To" }, { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 100 } }],
+        "responses": { "200": { "description": "sessions", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/api/v1/sites/{id}/reset": {
+      "post": {
+        "tags": ["sites"],
+        "summary": "Delete a site's events and rollups, keep the site",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "responses": { "204": { "description": "reset" } }
+      }
+    },
+    "/api/v1/sites/{id}/funnels": {
+      "get": {
+        "tags": ["analytics"],
+        "summary": "List funnel definitions",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "responses": { "200": { "description": "funnels", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      },
+      "post": {
+        "tags": ["analytics"],
+        "summary": "Create a funnel (2-8 page/event steps)",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["name", "steps"], "properties": { "name": { "type": "string" }, "steps": { "type": "array", "items": { "$ref": "#/components/schemas/FunnelStep" } } } } } } },
+        "responses": {
+          "201": { "description": "created", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Funnel" } } } },
+          "422": { "description": "invalid", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/v1/sites/{id}/funnels/{fid}": {
+      "get": {
+        "tags": ["analytics"],
+        "summary": "Evaluate a funnel over a range",
+        "description": "Reads raw events, limited by retention.",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }, { "$ref": "#/components/parameters/FunnelId" }, { "$ref": "#/components/parameters/Range" }, { "$ref": "#/components/parameters/From" }, { "$ref": "#/components/parameters/To" }],
+        "responses": { "200": { "description": "funnel and result", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      },
+      "put": {
+        "tags": ["analytics"],
+        "summary": "Edit a funnel",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }, { "$ref": "#/components/parameters/FunnelId" }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["name", "steps"], "properties": { "name": { "type": "string" }, "steps": { "type": "array", "items": { "$ref": "#/components/schemas/FunnelStep" } } } } } } },
+        "responses": { "200": { "description": "updated", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Funnel" } } } } }
+      },
+      "delete": {
+        "tags": ["analytics"],
+        "summary": "Delete a funnel",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }, { "$ref": "#/components/parameters/FunnelId" }],
+        "responses": { "204": { "description": "deleted" } }
+      }
+    },
+    "/api/v1/sites/{id}/journeys": {
+      "get": {
+        "tags": ["analytics"],
+        "summary": "Journey: paths visits take",
+        "description": "Top page sequences with visits and share, top pages per step position, and top step-to-step transitions. steps 2-7 (default 4), limit 1-100 (default 20), start keeps only visits whose first page matches. Reads raw events, limited by retention.",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }, { "$ref": "#/components/parameters/Range" }, { "$ref": "#/components/parameters/From" }, { "$ref": "#/components/parameters/To" }, { "name": "steps", "in": "query", "schema": { "type": "integer", "minimum": 2, "maximum": 7, "default": 4 } }, { "name": "limit", "in": "query", "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 20 } }, { "name": "start", "in": "query", "description": "Only visits whose first page is this path.", "schema": { "type": "string" } }],
+        "responses": {
+          "200": { "description": "range and journey report", "content": { "application/json": { "schema": { "type": "object", "properties": { "range": { "type": "string" }, "journeys": { "$ref": "#/components/schemas/JourneyReport" }, "truncated": { "type": "boolean" } } } } } },
+          "400": { "description": "bad range, steps or limit", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/v1/sites/{id}/google": {
+      "get": {
+        "tags": ["integrations"],
+        "summary": "Search Console connection status",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "responses": { "200": { "description": "status and redirect uri", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      },
+      "patch": {
+        "tags": ["integrations"],
+        "summary": "Pick the Search Console property",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["property"], "properties": { "property": { "type": "string" } } } } } },
+        "responses": { "200": { "description": "status", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      },
+      "delete": {
+        "tags": ["integrations"],
+        "summary": "Disconnect Search Console (revokes grant, deletes terms)",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "responses": { "204": { "description": "disconnected" } }
+      }
+    },
+    "/api/v1/sites/{id}/google/connect": {
+      "get": {
+        "tags": ["integrations"],
+        "summary": "Start the Google OAuth flow",
+        "description": "302s to Google. The callback lands on /api/v1/google/callback.",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "responses": { "302": { "description": "redirect to Google" } }
+      }
+    },
+    "/api/v1/sites/{id}/google/sync": {
+      "post": {
+        "tags": ["integrations"],
+        "summary": "Pull Search Console data now",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+"responses": { "200": { "description": "status", "content": { "application/json": { "schema": { "type": "object" } } } } } 
+      }
+    },
+    "/api/v1/google/callback": {
+      "get": {
+        "tags": ["integrations"],
+        "summary": "Google OAuth callback",
+        "security": [],
+        "parameters": [{ "name": "code", "in": "query", "schema": { "type": "string" } }, { "name": "state", "in": "query", "schema": { "type": "string" } }],
+        "responses": { "302": { "description": "redirect back to the site dashboard" } }
+      }
+    },
+    "/api/v1/sites/{id}/search-terms": {
+      "get": {
+        "tags": ["integrations"],
+        "summary": "Google search terms",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }, { "$ref": "#/components/parameters/Range" }, { "$ref": "#/components/parameters/Limit500" }],
+        "responses": { "200": { "description": "queries with clicks, impressions, position", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/api/v1/sites/{id}/polar": {
+      "get": {
+        "tags": ["integrations"],
+        "summary": "Polar connection status",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "responses": { "200": { "description": "status", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      },
+      "put": {
+        "tags": ["integrations"],
+        "summary": "Connect Polar (org token, product filter, webhook secret)",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "properties": { "access_token": { "type": "string" }, "server": { "type": "string" }, "product_ids": { "type": "string" }, "webhook_secret": { "type": "string" } } } } } },
+"responses": { "200": { "description": "status", "content": { "application/json": { "schema": { "type": "object" } } } } } 
+      },
+      "delete": {
+        "tags": ["integrations"],
+        "summary": "Disconnect Polar (deletes stored orders)",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "responses": { "204": { "description": "disconnected" } }
+      }
+    },
+    "/api/v1/sites/{id}/polar/sync": {
+      "post": {
+        "tags": ["integrations"],
+        "summary": "Reconcile Polar orders now",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+"responses": { "200": { "description": "status", "content": { "application/json": { "schema": { "type": "object" } } } } } 
+      }
+    },
+    "/api/v1/polar/webhook/{id}": {
+      "post": {
+        "tags": ["integrations"],
+        "summary": "Polar order webhook (order.* events)",
+        "security": [],
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "responses": { "200": { "description": "received" }, "401": { "description": "bad signature", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } } }
+      }
+    },
+    "/api/v1/sites/{id}/revenue": {
+      "get": {
+        "tags": ["integrations"],
+        "summary": "Polar revenue over a range",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }, { "$ref": "#/components/parameters/Range" }, { "$ref": "#/components/parameters/Limit" }],
+"responses": { "200": { "description": "totals, series, breakdowns", "content": { "application/json": { "schema": { "type": "object" } } } } } 
+      }
+    },
+    "/api/v1/sites/{id}/links": {
+      "get": {
+        "tags": ["integrations"],
+        "summary": "List short links and pixels",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "responses": { "200": { "description": "links", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      },
+      "post": {
+        "tags": ["integrations"],
+        "summary": "Create a short link or pixel",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["slug", "url"], "properties": { "slug": { "type": "string" }, "name": { "type": "string" }, "url": { "type": "string" }, "kind": { "type": "string", "enum": ["link", "pixel"] } } } } } },
+        "responses": {
+          "201": { "description": "created", "content": { "application/json": { "schema": { "type": "object" } } } },
+          "422": { "description": "invalid", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/v1/sites/{id}/links/{linkID}": {
+      "delete": {
+        "tags": ["integrations"],
+        "summary": "Delete a link (recorded clicks stay)",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }, { "$ref": "#/components/parameters/LinkId" }],
+        "responses": { "204": { "description": "deleted" } }
+      }
+    },
+    "/api/v1/sites/{id}/shares": {
+      "get": {
+        "tags": ["integrations"],
+        "summary": "List public share links",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "responses": { "200": { "description": "shares", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      },
+      "post": {
+        "tags": ["integrations"],
+        "summary": "Mint a public share link",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }],
+        "responses": { "201": { "description": "share", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/api/v1/sites/{id}/shares/{sid}": {
+      "delete": {
+        "tags": ["integrations"],
+        "summary": "Revoke a share link",
+        "parameters": [{ "$ref": "#/components/parameters/SiteId" }, { "$ref": "#/components/parameters/ShareId" }],
+        "responses": { "204": { "description": "revoked" } }
+      }
+    },
+    "/api/v1/favicon": {
+      "get": {
+        "tags": ["sites"],
+        "summary": "Cached referrer icon",
+        "parameters": [{ "name": "host", "in": "query", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "icon bytes" }, "404": { "description": "none cached" } }
+      }
+    },
+    "/api/v1/status": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "Counts, database size, uptime, ingest stats",
+        "responses": { "200": { "description": "status", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/api/v1/settings": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "General settings",
+        "responses": { "200": { "description": "settings", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GeneralSettings" } } } } }
+      },
+      "patch": {
+        "tags": ["admin"],
+        "summary": "Update accent, title, MCP switch, retention",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GeneralSettingsPatch" } } } },
+        "responses": { "200": { "description": "settings", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GeneralSettings" } } } } }
+      }
+    },
+    "/api/v1/tokens": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "List MCP tokens",
+        "responses": { "200": { "description": "tokens", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      },
+      "post": {
+        "tags": ["admin"],
+        "summary": "Mint an MCP token (secret shown once, GET-only)",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string" } } } } } },
+        "responses": { "201": { "description": "token and secret", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/api/v1/tokens/{id}": {
+      "delete": {
+        "tags": ["admin"],
+        "summary": "Revoke an MCP token",
+        "parameters": [{ "$ref": "#/components/parameters/TokenId" }],
+        "responses": { "204": { "description": "revoked" } }
+      }
+    },
+    "/api/v1/keys": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "List API keys (admins only)",
+        "responses": { "200": { "description": "keys", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      },
+      "post": {
+        "tags": ["admin"],
+        "summary": "Mint a full-access API key (secret shown once)",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string" }, "scopes": { "type": "string", "default": "read,write", "description": "read,write or read" } } } } } },
+        "responses": { "201": { "description": "key and secret", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/api/v1/keys/{id}/rotate": {
+      "post": {
+        "tags": ["admin"],
+        "summary": "Replace a key's secret in place",
+        "parameters": [{ "$ref": "#/components/parameters/TokenId" }],
+        "responses": { "200": { "description": "key and new secret", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/api/v1/keys/{id}": {
+      "delete": {
+        "tags": ["admin"],
+        "summary": "Revoke an API key",
+        "parameters": [{ "$ref": "#/components/parameters/TokenId" }],
+        "responses": { "204": { "description": "revoked" } }
+      }
+    },
+    "/api/v1/users": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "List accounts (admins only)",
+        "responses": { "200": { "description": "users", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      },
+      "post": {
+        "tags": ["admin"],
+        "summary": "Create an account with admin/member/viewer role",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["username", "password"], "properties": { "username": { "type": "string" }, "password": { "type": "string", "minLength": 8 }, "role": { "type": "string", "enum": ["admin", "member", "viewer"] } } } } } },
+        "responses": { "201": { "description": "user", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/api/v1/users/{uid}": {
+      "patch": {
+        "tags": ["admin"],
+        "summary": "Change role/password",
+        "parameters": [{ "$ref": "#/components/parameters/UserId" }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "properties": { "role": { "type": "string" }, "password": { "type": "string" } } } } } },
+        "responses": { "200": { "description": "user", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      },
+      "delete": {
+        "tags": ["admin"],
+        "summary": "Delete an account",
+        "parameters": [{ "$ref": "#/components/parameters/UserId" }],
+        "responses": { "204": { "description": "deleted" } }
+      }
+    },
+    "/api/v1/teams": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "List teams (admins only)",
+        "responses": { "200": { "description": "teams", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      },
+      "post": {
+        "tags": ["admin"],
+        "summary": "Create a team",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string" } } } } } },
+        "responses": { "201": { "description": "team", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/api/v1/teams/{tid}": {
+      "patch": {
+        "tags": ["admin"],
+        "summary": "Rename a team",
+        "parameters": [{ "$ref": "#/components/parameters/TeamId" }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["name"], "properties": { "name": { "type": "string" } } } } } },
+        "responses": { "200": { "description": "team", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      },
+      "delete": {
+        "tags": ["admin"],
+        "summary": "Delete a team",
+        "parameters": [{ "$ref": "#/components/parameters/TeamId" }],
+        "responses": { "204": { "description": "deleted" } }
+      }
+    },
+    "/api/v1/teams/{tid}/members": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "List team members",
+        "parameters": [{ "$ref": "#/components/parameters/TeamId" }],
+        "responses": { "200": { "description": "members", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      },
+      "post": {
+        "tags": ["admin"],
+        "summary": "Add a member",
+        "parameters": [{ "$ref": "#/components/parameters/TeamId" }],
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "required": ["user_id", "role"], "properties": { "user_id": { "type": "string" }, "role": { "type": "string" } } } } } },
+        "responses": { "200": { "description": "members", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/api/v1/teams/{tid}/members/{uid}": {
+      "delete": {
+        "tags": ["admin"],
+        "summary": "Remove a member",
+        "parameters": [{ "$ref": "#/components/parameters/TeamId" }, { "$ref": "#/components/parameters/UserId" }],
+        "responses": { "204": { "description": "removed" } }
+      }
+    },
+    "/api/v1/geoip": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "GeoIP location status",
+        "description": "Effective mode (off/country/city), source, database edition/build date/size, and sync state. The key and blob are never exposed.",
+        "responses": { "200": { "description": "config", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GeoIPConfig" } } } } }
+      },
+      "put": {
+        "tags": ["admin"],
+        "summary": "Set GeoIP mode, source and MaxMind key",
+        "requestBody": { "required": true, "content": { "application/json": { "schema": { "type": "object", "properties": { "mode": { "type": "string", "enum": ["off", "country", "city"] }, "source": { "type": "string", "enum": ["dbip", "maxmind"] }, "maxmind_key": { "type": "string", "description": "Empty clears the stored key." } } } } } },
+        "responses": {
+          "200": { "description": "config", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GeoIPConfig" } } } } ,
+          "422": { "description": "invalid (also when pinned by UMAGO_GEOIP_MODE/SOURCE)", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/v1/geoip/refresh": {
+      "post": {
+        "tags": ["admin"],
+        "summary": "Download the GeoIP database now",
+        "description": "DB-IP needs no key; MaxMind needs a license key. Keeps the previous blob on failure and records sync_error.",
+        "responses": {
+          "200": { "description": "config", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GeoIPConfig" } } } } ,
+          "502": { "description": "download failed", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/v1/geoip/upload": {
+      "post": {
+        "tags": ["admin"],
+        "summary": "Upload an .mmdb file (DB-IP or MaxMind, city or country)",
+        "requestBody": { "required": true, "content": { "multipart/form-data": { "schema": { "type": "object", "required": ["file"], "properties": { "file": { "type": "string", "format": "binary" } } } } } },
+        "responses": {
+          "200": { "description": "config", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GeoIPConfig" } } } } ,
+          "422": { "description": "not a valid .mmdb", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+        }
+      }
+    },
+    "/api/v1/geoip/data": {
+      "delete": {
+        "tags": ["admin"],
+        "summary": "Delete the stored database (settings stay)",
+        "responses": { "200": { "description": "config", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/GeoIPConfig" } } } } }
+      }
+    },
+    "/api/v1/rollup": {
+      "post": {
+        "tags": ["admin"],
+        "summary": "Flush the queue and rebuild today's rollups now",
+        "responses": { "204": { "description": "rebuilt" } }
+      }
+    },
+    "/api/v1/export": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "Export every site and daily rollup as JSON",
+        "responses": { "200": { "description": "export file", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/api/v1/openapi.json": {
+      "get": {
+        "tags": ["admin"],
+        "summary": "This OpenAPI document",
+        "security": [],
+        "responses": { "200": { "description": "OpenAPI 3.0 JSON", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    },
+    "/mcp": {
+      "post": {
+        "tags": ["mcp"],
+        "summary": "MCP endpoint (Streamable HTTP, read-only)",
+        "description": "Bearer UMAGO_MCP_TOKEN, an MCP token, an API key, or the admin session. Tools: list_sites, overview, site_stats, breakdown, search_terms, revenue, funnel, sessions, vitals.",
+        "responses": { "200": { "description": "MCP response", "content": { "application/json": { "schema": { "type": "object" } } } } }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "cookieAuth": { "type": "apiKey", "in": "cookie", "name": "umago_session" },
+      "basicAuth": { "type": "http", "scheme": "basic" },
+      "bearerAuth": { "type": "http", "scheme": "bearer", "bearerFormat": "umago_key_… / umago_tok_…" }
+    },
+    "parameters": {
+      "SiteId": { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+      "FunnelId": { "name": "fid", "in": "path", "required": true, "schema": { "type": "string" } },
+      "LinkId": { "name": "linkID", "in": "path", "required": true, "schema": { "type": "string" } },
+      "ShareId": { "name": "sid", "in": "path", "required": true, "schema": { "type": "string" } },
+      "UserId": { "name": "uid", "in": "path", "required": true, "schema": { "type": "string" } },
+      "TeamId": { "name": "tid", "in": "path", "required": true, "schema": { "type": "string" } },
+      "TokenId": { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+      "Slug": { "name": "slug", "in": "path", "required": true, "schema": { "type": "string" } },
+      "ShareSlug": { "name": "slug", "in": "path", "required": true, "schema": { "type": "string" } },
+      "ShareQuery": { "name": "share", "in": "query", "description": "Public share slug: read-only access to this site's GET endpoints.", "schema": { "type": "string" } },
+      "Range": { "name": "range", "in": "query", "description": "Empty uses the site's default range.", "schema": { "type": "string", "enum": ["", "24h", "48h", "7d", "30d", "90d", "180d", "custom"] } },
+      "From": { "name": "from", "in": "query", "description": "YYYY-MM-DD, for range=custom.", "schema": { "type": "string" } },
+      "To": { "name": "to", "in": "query", "description": "YYYY-MM-DD inclusive, for range=custom.", "schema": { "type": "string" } },
+      "Compare": { "name": "compare", "in": "query", "description": "compare=prev overlays the previous window.", "schema": { "type": "string", "enum": ["prev"] } },
+      "Limit": { "name": "limit", "in": "query", "schema": { "type": "integer", "default": 10 } },
+      "Limit500": { "name": "limit", "in": "query", "description": "1-500, default 500 for breakdowns.", "schema": { "type": "integer", "default": 500 } },
+      "Dim": { "name": "dim", "in": "query", "required": true, "schema": { "$ref": "#/components/schemas/Dim" } }
+    },
+    "schemas": {
+      "Error": { "type": "object", "required": ["error", "message"], "properties": { "error": { "type": "string", "example": "not_found" }, "message": { "type": "string" } } },
+      "Health": { "type": "object", "properties": { "status": { "type": "string" }, "version": { "type": "string" }, "queued_drops": { "type": "string" }, "database": { "type": "string" } } },
+      "Theme": { "type": "object", "properties": { "accent": { "type": "string" }, "title": { "type": "string" }, "script_name": { "type": "string", "description": "Canonical snippet path: first entry of UMAGO_SCRIPT_NAMES" } } },
+      "AuthState": { "type": "object", "properties": { "auth_required": { "type": "boolean" }, "authenticated": { "type": "boolean" }, "username": { "type": "string" }, "role": { "type": "string" }, "requires_2fa": { "type": "boolean" }, "challenge": { "type": "string" } } },
+      "CollectBody": {
+        "type": "object",
+        "required": ["s", "u"],
+        "properties": {
+          "s": { "type": "string", "description": "site id (data-site)" },
+          "n": { "type": "string", "description": "pageview (default), identify, vitals, or a custom event name" },
+          "u": { "type": "string", "description": "page URL; query carries utm_* and gclid/fbclid/msclkid/ttclid/li_fat_id/twclid" },
+          "r": { "type": "string", "description": "document.referrer" },
+          "w": { "type": "integer", "description": "screen width" },
+          "tz": { "type": "string", "description": "IANA time zone" },
+          "lang": { "type": "string" },
+          "title": { "type": "string" },
+          "id": { "type": "string", "description": "distinct id from umago.identify()" },
+          "tag": { "type": "string", "description": "data-tag" },
+          "x": { "description": "custom event properties" },
+          "lcp": { "type": "number" },
+          "inp": { "type": "number" },
+          "cls": { "type": "number" },
+          "fcp": { "type": "number" },
+          "ttfb": { "type": "number" }
+        }
+      },
+      "Dim": { "type": "string", "enum": ["page", "ref", "entry", "exit", "channel", "country", "region", "language", "device", "browser", "os", "title", "hostname", "tag", "event", "utm_source", "utm_medium", "utm_campaign", "utm_content", "utm_term", "gclid", "fbclid", "msclkid", "ttclid", "li_fat_id", "twclid", "distinct_id"] },
+      "Point": { "type": "object", "properties": { "t": { "type": "string", "format": "date-time" }, "pageviews": { "type": "integer" }, "visitors": { "type": "integer" } } },
+      "Row": { "type": "object", "properties": { "key": { "type": "string" }, "pageviews": { "type": "integer" }, "visitors": { "type": "integer" } } },
+      "Totals": { "type": "object", "properties": { "pageviews": { "type": "integer" }, "visitors": { "type": "integer" }, "visits": { "type": "integer" }, "bounces": { "type": "integer" }, "duration": { "type": "integer" } } },
+      "Summary": {
+        "type": "object",
+        "properties": {
+          "range": { "type": "string" },
+          "from": { "type": "string" },
+          "to": { "type": "string" },
+          "bucket": { "type": "string", "enum": ["hour", "day"] },
+          "totals": { "$ref": "#/components/schemas/Totals" },
+          "previous": { "$ref": "#/components/schemas/Totals" },
+          "series": { "type": "array", "items": { "$ref": "#/components/schemas/Point" } },
+          "markers": { "type": "array", "items": { "type": "object" } },
+          "breakdowns": { "type": "object", "additionalProperties": { "type": "array", "items": { "$ref": "#/components/schemas/Row" } } },
+          "filters": { "type": "object" },
+          "truncated": { "type": "boolean" },
+          "previous_unavailable": { "type": "boolean" },
+          "retention_days": { "type": "integer" },
+          "prev_series": { "type": "array", "items": { "$ref": "#/components/schemas/Point" } },
+          "prev_breakdowns": { "type": "object", "additionalProperties": { "type": "array", "items": { "$ref": "#/components/schemas/Row" } } }
+        }
+      },
+      "Live": {
+        "type": "object",
+        "properties": {
+          "total": { "type": "integer", "description": "distinct visitors, last 5 minutes" },
+          "countries": { "type": "array", "items": { "$ref": "#/components/schemas/Row" } },
+          "recent": { "type": "array", "items": { "type": "object", "properties": { "at": { "type": "string" }, "country": { "type": "string" }, "path": { "type": "string" } } } },
+          "minutes": { "type": "array", "items": { "type": "integer" }, "description": "distinct visitors per minute, last 30, oldest first" },
+          "total_30m": { "type": "integer" },
+          "pages": { "type": "array", "items": { "$ref": "#/components/schemas/Row" }, "description": "top pages right now, last 5 minutes" }
+        }
+      },
+      "Site": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "name": { "type": "string" },
+          "domain": { "type": "string" },
+          "home_country": { "type": "string" },
+          "accent": { "type": "string" },
+          "default_range": { "type": "string" },
+          "owner_team_id": { "type": "string" },
+          "has_favicon": { "type": "boolean" },
+          "position": { "type": "integer" },
+          "created_at": { "type": "string" },
+          "updated_at": { "type": "string" },
+          "card": { "type": "object" },
+          "live": { "type": "integer" }
+        }
+      },
+      "SitePatch": { "type": "object", "properties": { "name": { "type": "string" }, "domain": { "type": "string" }, "home_country": { "type": "string" }, "accent": { "type": "string" }, "default_range": { "type": "string" }, "owner_team_id": { "type": "string" } } },
+      "FunnelStep": { "type": "object", "required": ["type", "value"], "properties": { "type": { "type": "string", "enum": ["page", "event"] }, "value": { "type": "string" } } },
+      "Funnel": { "type": "object", "properties": { "id": { "type": "string" }, "site_id": { "type": "string" }, "name": { "type": "string" }, "steps": { "type": "array", "items": { "$ref": "#/components/schemas/FunnelStep" } }, "created_at": { "type": "string" }, "updated_at": { "type": "string" } } },
+      "JourneyReport": { "type": "object", "properties": { "steps": { "type": "integer" }, "visits": { "type": "integer" }, "paths": { "type": "array", "items": { "type": "object", "properties": { "pages": { "type": "array", "items": { "type": "string" } }, "visits": { "type": "integer" }, "rate": { "type": "number" } } } }, "step_pages": { "type": "array", "items": { "type": "array", "items": { "type": "object", "properties": { "page": { "type": "string" }, "visits": { "type": "integer" } } } } }, "transitions": { "type": "array", "items": { "type": "object", "properties": { "step": { "type": "integer" }, "from": { "type": "string" }, "to": { "type": "string" }, "visits": { "type": "integer" } } } }, "truncated": { "type": "boolean" } } },
+      "GeoIPConfig": { "type": "object", "properties": { "mode": { "type": "string" }, "mode_from_env": { "type": "boolean" }, "source": { "type": "string" }, "source_from_env": { "type": "boolean" }, "has_maxmind_key": { "type": "boolean" }, "key_from_env": { "type": "boolean" }, "edition": { "type": "string" }, "build_date": { "type": "string" }, "size_bytes": { "type": "integer" }, "has_data": { "type": "boolean" }, "sync_error": { "type": "string" }, "synced_at": { "type": "string" }, "file_path": { "type": "string" } } },
+      "GeneralSettings": { "type": "object", "properties": { "accent": { "type": "string" }, "title": { "type": "string" }, "mcp_enabled": { "type": "boolean" }, "retention_days": { "type": "integer" }, "retention_from_env": { "type": "boolean" } } },
+      "GeneralSettingsPatch": { "type": "object", "properties": { "accent": { "type": "string" }, "title": { "type": "string" }, "mcp_enabled": { "type": "boolean" }, "retention_days": { "type": "integer", "minimum": 2, "maximum": 90 } } }
+    }
+  },
+  "security": [{ "cookieAuth": [] }, { "basicAuth": [] }, { "bearerAuth": [] }]
+}

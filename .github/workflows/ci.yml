@@ -1,0 +1,148 @@
+name: CI
+
+# Tags are plain x.y.z with no v prefix, e.g. 1.2.3.
+on:
+  push:
+    tags: ["[0-9]+.[0-9]+.[0-9]+"]
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/philippdormann/umago
+
+jobs:
+  go:
+    name: Go
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+      - name: Vet
+        working-directory: server
+        run: go vet ./...
+      - name: Test
+        working-directory: server
+        run: go test -race ./...
+      - uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1
+        with:
+          go-version-file: server/go.mod
+          repo-checkout: false
+          work-dir: server
+
+  web:
+    name: Web
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.4.4"
+      - working-directory: server/web
+        run: bun install --frozen-lockfile
+      - name: Check
+        working-directory: server/web
+        run: bun run check
+      - name: Test
+        working-directory: server/web
+        run: bun run test
+      - name: Build
+        working-directory: server/web
+        run: bun run build
+      - name: Audit
+        working-directory: server/web
+        # Gate on high+ like the Trivy scan: lows with no in-range fix
+        # (e.g. deepmerge via vite-plugin-svelte) must not break releases.
+        run: bun audit --audit-level=high
+
+  trivy-fs:
+    # Dependency gate on the repo itself: fails the run on any
+    # HIGH/CRITICAL CVE in Go modules or the bun lockfile.
+    name: Trivy filesystem scan
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Scan repo for HIGH/CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+  image:
+    name: Build image
+    needs: [go, web, trivy-fs]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      # Push once to an ephemeral tag so the release tags below only ever
+      # point at an image that already passed the Trivy scan.
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: server
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}:ci-${{ github.sha }}
+          build-args: VERSION=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  trivy-image:
+    # Scans the ephemeral image. Release tags are only created by the
+    # publish job once this passes, so a failure never pollutes them.
+    name: Trivy image scan
+    needs: [image]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Scan image for HIGH/CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.IMAGE }}:ci-${{ github.sha }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+
+  publish:
+    # Promotes the already-scanned digest to release tags without rebuilding:
+    # the scanned artifact and the released artifact are identical.
+    name: Publish release tags
+    needs: [trivy-image]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Promote scanned image to release tags
+        run: |
+          ver="${GITHUB_REF_NAME}"            # e.g. 1.2.3, no v prefix
+          major="${ver%%.*}"                  # 1
+          minor="${ver%.*}"                   # 1.2
+          docker buildx imagetools create \
+            -t "${IMAGE}:${ver}" \
+            -t "${IMAGE}:${minor}" \
+            -t "${IMAGE}:${major}" \
+            -t "${IMAGE}:latest" \
+            "${IMAGE}:ci-${GITHUB_SHA}"

@@ -1,0 +1,39 @@
+services:
+  umago:
+    build:
+      context: ./server
+    image: ghcr.io/philippdormann/umago:latest
+    restart: unless-stopped
+    ports:
+      - "8082:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      UMAGO_DATABASE_URL: postgres://umago:${POSTGRES_PASSWORD:-umago}@postgres:5432/umago?sslmode=disable
+      UMAGO_ADMIN_USER: ${UMAGO_ADMIN_USER:-admin}
+      UMAGO_ADMIN_PASSWORD: ${UMAGO_ADMIN_PASSWORD:-change-me-please}
+      UMAGO_LOG_LEVEL: ${UMAGO_LOG_LEVEL:-info}
+      UMAGO_RETENTION_DAYS: ${UMAGO_RETENTION_DAYS:-7}
+      UMAGO_MCP_TOKEN: ${UMAGO_MCP_TOKEN:-}
+      UMAGO_SCRIPT_NAMES: ${UMAGO_SCRIPT_NAMES:-}
+      UMAGO_GOOGLE_CLIENT_ID: ${UMAGO_GOOGLE_CLIENT_ID:-}
+      UMAGO_GOOGLE_CLIENT_SECRET: ${UMAGO_GOOGLE_CLIENT_SECRET:-}
+
+  postgres:
+    image: postgres:18-alpine@sha256:123b17998ccaf47e53b502e8c6a1e79afd8f579c6f3eec83c563da026f957395
+    restart: unless-stopped
+    volumes:
+      - pgdata:/var/lib/postgresql
+    environment:
+      POSTGRES_USER: umago
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-umago}
+      POSTGRES_DB: umago
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U umago -d umago"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  pgdata:

@@ -1,0 +1,777 @@
+// Package mcp exposes Umago's analytics to AI agents over the Model Context
+// Protocol. Every tool is read-only. Besides raw numbers the tools return
+// small computed signals (deltas, trend, spikes) so an agent can answer
+// "how are my sites doing" without doing arithmetic on long series.
+package mcp
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"math"
+	"net/http"
+	"sort"
+	"strings"
+	"time"
+
+	sdk "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/philippdormann/umago/server/internal/funnels"
+	"github.com/philippdormann/umago/server/internal/journeys"
+	"github.com/philippdormann/umago/server/internal/polar"
+	"github.com/philippdormann/umago/server/internal/searchconsole"
+	"github.com/philippdormann/umago/server/internal/sites"
+	"github.com/philippdormann/umago/server/internal/stats"
+)
+
+// Stores is what the tools read from.
+type Stores struct {
+	// RetentionDays bounds filtered views, which read raw events.
+	RetentionDays func(ctx context.Context) int
+	Sites         *sites.Store
+	Stats         *stats.Store
+	Search        *searchconsole.Store
+	Revenue       *polar.Store
+	Funnels       *funnels.Store
+	Journeys      *journeys.Store
+	Now           func() time.Time
+}
+
+// NewServer builds the MCP server with every tool registered.
+func NewServer(st Stores, version string) *sdk.Server {
+	if st.Now == nil {
+		st.Now = time.Now
+	}
+	s := sdk.NewServer(&sdk.Implementation{Name: "umago", Title: "Umago", Version: version}, &sdk.ServerOptions{
+		Instructions: "Umago is a self-hosted, cookieless web analytics service tracking the owner's websites. These tools are read-only. " +
+			"Ranges are 24h, 48h, 7d, 30d, 90d or 180d and always end now. Visitors are daily uniques (multi-day totals sum daily uniques); pageviews are raw counts. " +
+			"Every stats result includes a comparison with the equal window before it (delta_pct), a trend (second half of the window vs the first), and spikes (buckets far above the window's mean). " +
+			"Start with overview for all sites at once, then site_stats for detail, breakdown for full lists of pages, referrers, countries, devices, browsers, operating systems or events, and journey for the paths visits take through a site. " + "Sites can be referred to by id, name or domain. " +
+			"site_stats and breakdown accept filters, a map of dimension to key, which narrows everything to the visitors who matched every entry (a visitor who arrived from google.com and then browsed three pages contributes all three under ref=google.com; an empty ref means direct). Filtered views are computed from raw events, which are kept only for the retention period, so the answer may carry truncated=true with retention_days and previous_unavailable=true; say so rather than presenting a cut-short window as the full range. " +
+			"search_terms lists the Google search queries that brought clicks and impressions, from Search Console; it is only populated for sites the owner has connected, and Google's data trails by two to three days. " +
+			"revenue gives Polar sales for a site: totals, the previous window, a series, revenue per visitor, and revenue attributed to first-touch referrer, source, campaign, landing page, country and product. Revenue is net of discounts and tax, less refunds, in minor units (cents, pence) of the given currency; refunds reduce the day the order was placed. " +
+			"Attribution works like this: the site's snippet records each visitor's first referrer and landing URL in their own browser, the site passes them into the Polar checkout metadata, and Umago normalises them with the same rules as page views, so 'revenue by source' lines up with 'sources'. Orders placed before the site started passing attribution, and orders whose buyer arrived direct, both appear under the empty key; attributed_orders and unattributed_orders say how many of each there are, so do not read an empty-key total as 'direct traffic converts best' when most orders predate attribution.",
+	})
+	t := &tools{st: st}
+	ro := &sdk.ToolAnnotations{ReadOnlyHint: true, IdempotentHint: true, OpenWorldHint: boolPtr(false)}
+
+	sdk.AddTool(s, &sdk.Tool{Name: "list_sites", Title: "List sites", Annotations: ro,
+		Description: "List every tracked website with its id, name, domain, visitors this week and last week, and visitors online right now."}, t.listSites)
+	sdk.AddTool(s, &sdk.Tool{Name: "overview", Title: "Overview of all sites", Annotations: ro,
+		Description: "Totals for every site over a range with the change versus the previous equal window, a trend, spike buckets, and the top page, referrer and country. The best first call for questions like 'how are my sites doing this week'."}, t.overview)
+	sdk.AddTool(s, &sdk.Tool{Name: "site_stats", Title: "Site stats", Annotations: ro,
+		Description: "Full detail for one site over a range: totals, previous window, delta, trend, spikes, the time series (hourly for 24h, 48h and 7d, daily for the longer ranges) and the top 10 of every breakdown. Pass filters to narrow to visitors who matched, e.g. pages viewed by visitors from a referrer, or referrers of visitors who fired an event; filtered answers come from raw events and may be truncated to the retention window."}, t.siteStats)
+	sdk.AddTool(s, &sdk.Tool{Name: "breakdown", Title: "Breakdown", Annotations: ro,
+		Description: "The full list for one dimension of one site over a range, best first: page, ref (referrer host, empty = direct), entry, exit, channel, country (ISO code, empty = unknown), region (time-zone city), language, device, browser, os, title, hostname, event, utm_source, utm_medium, utm_campaign, utm_content, utm_term, gclid, fbclid, msclkid, ttclid, li_fat_id, twclid, distinct_id. Accepts the same filters as site_stats."}, t.breakdown)
+	sdk.AddTool(s, &sdk.Tool{Name: "search_terms", Title: "Google search terms", Annotations: ro,
+		Description: "The Google search queries that sent visitors to one site over a range, from Search Console, most clicked first, with impressions and average position. Empty when the site is not connected."}, t.searchTerms)
+	sdk.AddTool(s, &sdk.Tool{Name: "revenue", Title: "Revenue", Annotations: ro,
+		Description: "Polar revenue for one site over a range: totals and previous window (minor currency units, net of discounts, tax and refunds), a per-bucket series, revenue per visitor, and revenue by first-touch referrer, source, campaign, landing page, country and product. The empty key in a breakdown mixes direct buyers with orders that predate attribution; attributed_orders versus unattributed_orders tells you which dominates. Empty when the site is not connected."}, t.revenue)
+	sdk.AddTool(s, &sdk.Tool{Name: "funnel", Title: "Funnel", Annotations: ro,
+		Description: "Evaluate a saved funnel for one site over a range: visitor-days reaching each page/event step in order, with step rates and overall conversion. Reads raw events, so it only reaches back as far as the retention period."}, t.funnel)
+	sdk.AddTool(s, &sdk.Tool{Name: "journey", Title: "Journey", Annotations: ro,
+		Description: "Paths visits take through one site over a range: top page sequences with visits and share of visits, top pages per step position, and top step-to-step transitions. Reads raw events, so it only reaches back as far as the retention period."}, t.journey)
+	sdk.AddTool(s, &sdk.Tool{Name: "sessions", Title: "Sessions", Annotations: ro,
+		Description: "Recent visits for one site, newest first: start, duration, pageviews, events, entry and exit pages, country, browser and device. Reads raw events, so it only reaches back as far as the retention period."}, t.sessions)
+	sdk.AddTool(s, &sdk.Tool{Name: "vitals", Title: "Web vitals", Annotations: ro,
+		Description: "Web Vitals percentiles (LCP, INP, CLS, FCP, TTFB) for one site plus the slowest paths by LCP p75. Empty unless the site's snippet runs with data-performance."}, t.vitals)
+	return s
+}
+
+// Handler returns an HTTP handler speaking Streamable HTTP. Authentication
+// is the caller's job (wrap it).
+func Handler(s *sdk.Server, log *slog.Logger) http.Handler {
+	return sdk.NewStreamableHTTPHandler(func(*http.Request) *sdk.Server { return s }, &sdk.StreamableHTTPOptions{
+		Stateless: true, JSONResponse: true, Logger: log,
+		DisableLocalhostProtection: true,
+	})
+}
+
+type tools struct{ st Stores }
+
+func (t *tools) resolve(ctx context.Context, ref string) (sites.Site, error) {
+	ref = strings.TrimSpace(strings.ToLower(ref))
+	if ref == "" {
+		return sites.Site{}, fmt.Errorf("site is required (id, name or domain)")
+	}
+	list, err := t.st.Sites.List(ctx)
+	if err != nil {
+		return sites.Site{}, err
+	}
+	for _, s := range list {
+		if strings.ToLower(s.ID) == ref || strings.ToLower(s.Domain) == ref || strings.ToLower(s.Name) == ref {
+			return s, nil
+		}
+	}
+	for _, s := range list {
+		if strings.Contains(strings.ToLower(s.Name), ref) || strings.Contains(strings.ToLower(s.Domain), ref) {
+			return s, nil
+		}
+	}
+	return sites.Site{}, fmt.Errorf("no site matches %q; call list_sites", ref)
+}
+
+func normRange(r string) (string, error) {
+	r = strings.ToLower(strings.TrimSpace(r))
+	switch r {
+	case "":
+		return "7d", nil
+	case "24h", "1d", "day", "today":
+		return "24h", nil
+	case "48h", "2d", "two days":
+		return "48h", nil
+	case "7d", "week", "1w":
+		return "7d", nil
+	case "30d", "month", "1m":
+		return "30d", nil
+	case "90d", "quarter", "3m":
+		return "90d", nil
+	case "180d", "6m", "half year", "6 months":
+		return "180d", nil
+	}
+	if stats.ValidRange(r) {
+		return r, nil
+	}
+	return "", fmt.Errorf("range must be one of %s", strings.Join(stats.Ranges, ", "))
+}
+
+// ---- analysis ----
+
+// Signals are the computed summaries attached to every stats answer.
+type Signals struct {
+	VisitorsDeltaPct  *float64 `json:"visitors_delta_pct" jsonschema:"percent change in visitors versus the previous equal window; null when the previous window had none"`
+	PageviewsDeltaPct *float64 `json:"pageviews_delta_pct"`
+	Trend             string   `json:"trend" jsonschema:"rising, falling or flat: visitors in the second half of the window versus the first"`
+	TrendPct          float64  `json:"trend_pct" jsonschema:"percent change from the first half of the window to the second"`
+	Spikes            []Spike  `json:"spikes" jsonschema:"buckets whose visitors were far above the window's mean"`
+	PeakBucket        string   `json:"peak_bucket,omitempty" jsonschema:"start of the busiest bucket"`
+	PeakVisitors      int      `json:"peak_visitors,omitempty"`
+	ViewsPerVisitor   float64  `json:"views_per_visitor"`
+}
+
+// Spike is one unusually busy bucket.
+type Spike struct {
+	Bucket   string  `json:"bucket" jsonschema:"bucket start, RFC 3339 UTC"`
+	Visitors int     `json:"visitors"`
+	Ratio    float64 `json:"ratio_to_mean" jsonschema:"visitors divided by the window mean"`
+}
+
+func pct(now, prev int) *float64 {
+	if prev == 0 {
+		return nil
+	}
+	v := math.Round(float64(now-prev)/float64(prev)*1000) / 10
+	return &v
+}
+
+// Analyse derives Signals from a summary.
+func Analyse(sum stats.Summary) Signals {
+	sig := Signals{VisitorsDeltaPct: pct(sum.Totals.Visitors, sum.Previous.Visitors), PageviewsDeltaPct: pct(sum.Totals.Pageviews, sum.Previous.Pageviews), Spikes: []Spike{}, Trend: "flat"}
+	if sum.PreviousUnavailable {
+		sig.VisitorsDeltaPct, sig.PageviewsDeltaPct = nil, nil
+	}
+	if sum.Totals.Visitors > 0 {
+		sig.ViewsPerVisitor = math.Round(float64(sum.Totals.Pageviews)/float64(sum.Totals.Visitors)*100) / 100
+	}
+	n := len(sum.Series)
+	if n == 0 {
+		return sig
+	}
+	var total, first, second int
+	for i, p := range sum.Series {
+		total += p.Visitors
+		if i < n/2 {
+			first += p.Visitors
+		} else {
+			second += p.Visitors
+		}
+		if p.Visitors > sig.PeakVisitors {
+			sig.PeakVisitors, sig.PeakBucket = p.Visitors, p.T
+		}
+	}
+	if first > 0 {
+		sig.TrendPct = math.Round(float64(second-first)/float64(first)*1000) / 10
+		switch {
+		case sig.TrendPct >= 15:
+			sig.Trend = "rising"
+		case sig.TrendPct <= -15:
+			sig.Trend = "falling"
+		}
+	} else if second > 0 {
+		sig.Trend, sig.TrendPct = "rising", 100
+	}
+	mean := float64(total) / float64(n)
+	var variance float64
+	for _, p := range sum.Series {
+		d := float64(p.Visitors) - mean
+		variance += d * d
+	}
+	sd := math.Sqrt(variance / float64(n))
+	for _, p := range sum.Series {
+		if mean > 0 && p.Visitors >= 5 && float64(p.Visitors) > mean+2*sd && float64(p.Visitors) > 2*mean {
+			sig.Spikes = append(sig.Spikes, Spike{Bucket: p.T, Visitors: p.Visitors, Ratio: math.Round(float64(p.Visitors)/mean*10) / 10})
+		}
+	}
+	sort.Slice(sig.Spikes, func(i, j int) bool { return sig.Spikes[i].Visitors > sig.Spikes[j].Visitors })
+	if len(sig.Spikes) > 5 {
+		sig.Spikes = sig.Spikes[:5]
+	}
+	return sig
+}
+
+// ---- list_sites ----
+
+type ListSitesIn struct{}
+
+type SiteOut struct {
+	ID           string `json:"id"`
+	Name         string `json:"name"`
+	Domain       string `json:"domain"`
+	VisitorsWeek int    `json:"visitors_this_week"`
+	VisitorsPrev int    `json:"visitors_last_week"`
+	Online       int    `json:"online_now" jsonschema:"distinct visitors seen in the last five minutes"`
+}
+
+type ListSitesOut struct {
+	Sites []SiteOut `json:"sites"`
+}
+
+func (t *tools) listSites(ctx context.Context, _ *sdk.CallToolRequest, _ ListSitesIn) (*sdk.CallToolResult, ListSitesOut, error) {
+	list, err := t.st.Sites.List(ctx)
+	if err != nil {
+		return nil, ListSitesOut{}, err
+	}
+	now := t.st.Now()
+	out := ListSitesOut{Sites: []SiteOut{}}
+	for _, s := range list {
+		card, err := t.st.Stats.Card(ctx, s.ID, now)
+		if err != nil {
+			return nil, ListSitesOut{}, err
+		}
+		live, _ := t.st.Stats.LiveVisitors(ctx, s.ID, now)
+		out.Sites = append(out.Sites, SiteOut{ID: s.ID, Name: s.Name, Domain: s.Domain, VisitorsWeek: card.Visitors, VisitorsPrev: card.Previous, Online: live})
+	}
+	return nil, out, nil
+}
+
+// ---- overview ----
+
+type OverviewIn struct {
+	Range string `json:"range,omitempty" jsonschema:"24h, 48h, 7d, 30d, 90d or 180d; default 7d"`
+}
+
+type SiteOverview struct {
+	ID          string      `json:"id"`
+	Name        string      `json:"name"`
+	Domain      string      `json:"domain"`
+	Visitors    int         `json:"visitors"`
+	Pageviews   int         `json:"pageviews"`
+	PrevVisits  int         `json:"previous_visitors"`
+	PrevViews   int         `json:"previous_pageviews"`
+	Signals     Signals     `json:"signals"`
+	TopPage     *stats.Row  `json:"top_page,omitempty"`
+	TopReferrer *stats.Row  `json:"top_referrer,omitempty" jsonschema:"empty key means direct"`
+	TopCountry  *stats.Row  `json:"top_country,omitempty"`
+	TopEvents   []stats.Row `json:"top_events,omitempty"`
+}
+
+type OverviewOut struct {
+	Range    string         `json:"range"`
+	From     string         `json:"from"`
+	To       string         `json:"to"`
+	Totals   stats.Totals   `json:"totals" jsonschema:"all sites combined"`
+	Previous stats.Totals   `json:"previous"`
+	Sites    []SiteOverview `json:"sites" jsonschema:"busiest first"`
+}
+
+func firstRow(rows []stats.Row) *stats.Row {
+	if len(rows) == 0 {
+		return nil
+	}
+	r := rows[0]
+	return &r
+}
+
+func (t *tools) overview(ctx context.Context, _ *sdk.CallToolRequest, in OverviewIn) (*sdk.CallToolResult, OverviewOut, error) {
+	rng, err := normRange(in.Range)
+	if err != nil {
+		return nil, OverviewOut{}, err
+	}
+	list, err := t.st.Sites.List(ctx)
+	if err != nil {
+		return nil, OverviewOut{}, err
+	}
+	now := t.st.Now()
+	out := OverviewOut{Range: rng, Sites: []SiteOverview{}}
+	for _, s := range list {
+		sum, err := t.st.Stats.Summary(ctx, s.ID, rng, now, 3)
+		if err != nil {
+			return nil, OverviewOut{}, err
+		}
+		out.From, out.To = sum.From, sum.To
+		out.Totals.Visitors += sum.Totals.Visitors
+		out.Totals.Pageviews += sum.Totals.Pageviews
+		out.Previous.Visitors += sum.Previous.Visitors
+		out.Previous.Pageviews += sum.Previous.Pageviews
+		out.Sites = append(out.Sites, SiteOverview{
+			ID: s.ID, Name: s.Name, Domain: s.Domain,
+			Visitors: sum.Totals.Visitors, Pageviews: sum.Totals.Pageviews, PrevVisits: sum.Previous.Visitors, PrevViews: sum.Previous.Pageviews,
+			Signals: Analyse(sum), TopPage: firstRow(sum.Breakdowns["page"]), TopReferrer: firstRow(sum.Breakdowns["ref"]), TopCountry: firstRow(sum.Breakdowns["country"]), TopEvents: sum.Breakdowns["event"],
+		})
+	}
+	sort.SliceStable(out.Sites, func(i, j int) bool { return out.Sites[i].Visitors > out.Sites[j].Visitors })
+	return nil, out, nil
+}
+
+// ---- site_stats ----
+
+type SiteStatsIn struct {
+	Site    string            `json:"site" jsonschema:"site id, name or domain"`
+	Range   string            `json:"range,omitempty" jsonschema:"24h, 48h, 7d, 30d, 90d or 180d; default 7d"`
+	Filters map[string]string `json:"filters,omitempty" jsonschema:"narrow to visitors matching every entry, dimension to key, e.g. {\"ref\": \"google.com\", \"country\": \"GB\"}; an empty ref means direct. Filtered views come from raw events and only reach back as far as retention, so truncated may be set"`
+}
+
+type SiteStatsOut struct {
+	Site    SiteOut       `json:"site"`
+	Stats   stats.Summary `json:"stats"`
+	Signals Signals       `json:"signals"`
+}
+
+func (t *tools) siteStats(ctx context.Context, _ *sdk.CallToolRequest, in SiteStatsIn) (*sdk.CallToolResult, SiteStatsOut, error) {
+	s, err := t.resolve(ctx, in.Site)
+	if err != nil {
+		return nil, SiteStatsOut{}, err
+	}
+	rng, err := normRange(in.Range)
+	if err != nil {
+		return nil, SiteStatsOut{}, err
+	}
+	now := t.st.Now()
+	var sum stats.Summary
+	if f := t.filters(in.Filters); len(f) > 0 {
+		sum, err = t.st.Stats.FilteredSummary(ctx, s.ID, rng, now, 10, f, t.retention(ctx))
+	} else {
+		sum, err = t.st.Stats.Summary(ctx, s.ID, rng, now, 10)
+	}
+	if err != nil {
+		return nil, SiteStatsOut{}, err
+	}
+	card, _ := t.st.Stats.Card(ctx, s.ID, now)
+	live, _ := t.st.Stats.LiveVisitors(ctx, s.ID, now)
+	return nil, SiteStatsOut{Site: SiteOut{ID: s.ID, Name: s.Name, Domain: s.Domain, VisitorsWeek: card.Visitors, VisitorsPrev: card.Previous, Online: live}, Stats: sum, Signals: Analyse(sum)}, nil
+}
+
+// ---- breakdown ----
+
+type BreakdownIn struct {
+	Site    string            `json:"site" jsonschema:"site id, name or domain"`
+	Dim     string            `json:"dim" jsonschema:"page, ref, entry, exit, channel, country, region, language, device, browser, os, title, hostname, event, utm_source, utm_medium, utm_campaign, utm_content, utm_term, gclid, fbclid, msclkid, ttclid, li_fat_id, twclid or distinct_id"`
+	Range   string            `json:"range,omitempty" jsonschema:"24h, 48h, 7d, 30d, 90d or 180d; default 7d"`
+	Limit   int               `json:"limit,omitempty" jsonschema:"1-500, default 100"`
+	Filters map[string]string `json:"filters,omitempty" jsonschema:"narrow to visitors matching every entry, dimension to key; see site_stats"`
+}
+
+type BreakdownOut struct {
+	Site  string      `json:"site"`
+	Dim   string      `json:"dim"`
+	Range string      `json:"range"`
+	Rows  []stats.Row `json:"rows" jsonschema:"best first; visitors are daily uniques summed over the range"`
+}
+
+func (t *tools) breakdown(ctx context.Context, _ *sdk.CallToolRequest, in BreakdownIn) (*sdk.CallToolResult, BreakdownOut, error) {
+	s, err := t.resolve(ctx, in.Site)
+	if err != nil {
+		return nil, BreakdownOut{}, err
+	}
+	rng, err := normRange(in.Range)
+	if err != nil {
+		return nil, BreakdownOut{}, err
+	}
+	dim := strings.ToLower(strings.TrimSpace(in.Dim))
+	switch dim {
+	case "pages":
+		dim = "page"
+	case "referrer", "referrers", "refs":
+		dim = "ref"
+	case "countries":
+		dim = "country"
+	case "devices":
+		dim = "device"
+	case "browsers":
+		dim = "browser"
+	case "events":
+		dim = "event"
+	case "regions", "cities", "city":
+		dim = "region"
+	case "source", "sources", "utm", "utm_sources":
+		dim = "utm_source"
+	case "medium", "utm_medium":
+		dim = "utm_medium"
+	case "campaign", "campaigns", "utm_campaigns":
+		dim = "utm_campaign"
+	case "content", "utm_content":
+		dim = "utm_content"
+	case "term", "terms", "utm_term":
+		dim = "utm_term"
+	case "channel", "channels":
+		dim = "channel"
+	case "language", "languages", "locale":
+		dim = "language"
+	case "titles":
+		dim = "title"
+	case "tags", "tag":
+		dim = "tag"
+	case "hosts", "hostname", "hostnames":
+		dim = "hostname"
+	case "entry", "entries", "landing", "landings":
+		dim = "entry"
+	case "exits":
+		dim = "exit"
+	case "user", "users", "distinct", "distinct_id":
+		dim = "distinct_id"
+	}
+	if !stats.ValidDim(dim) {
+		return nil, BreakdownOut{}, fmt.Errorf("dim must be one of %s", strings.Join(stats.Dims, ", "))
+	}
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	var rows []stats.Row
+	if f := t.filters(in.Filters); len(f) > 0 {
+		rows, err = t.st.Stats.FilteredBreakdown(ctx, s.ID, dim, rng, t.st.Now(), limit, f, t.retention(ctx))
+	} else {
+		rows, err = t.st.Stats.Breakdown(ctx, s.ID, dim, rng, t.st.Now(), limit)
+	}
+	if err != nil {
+		return nil, BreakdownOut{}, err
+	}
+	return nil, BreakdownOut{Site: s.Name, Dim: dim, Range: rng, Rows: rows}, nil
+}
+
+type SearchTermsIn struct {
+	Site  string `json:"site" jsonschema:"site id, name or domain"`
+	Range string `json:"range,omitempty" jsonschema:"24h, 48h, 7d, 30d, 90d or 180d; default 30d. Search Console trails by two to three days so 24h is usually empty"`
+	Limit int    `json:"limit,omitempty" jsonschema:"1-500, default 100"`
+}
+
+type SearchTermsOut struct {
+	Site      string               `json:"site"`
+	Range     string               `json:"range"`
+	Connected bool                 `json:"connected" jsonschema:"false when the site has no Search Console connection"`
+	Rows      []searchconsole.Term `json:"rows" jsonschema:"most clicked first; position is the impression-weighted average ranking"`
+}
+
+func (t *tools) searchTerms(ctx context.Context, _ *sdk.CallToolRequest, in SearchTermsIn) (*sdk.CallToolResult, SearchTermsOut, error) {
+	s, err := t.resolve(ctx, in.Site)
+	if err != nil {
+		return nil, SearchTermsOut{}, err
+	}
+	if in.Range == "" {
+		in.Range = "30d"
+	}
+	rng, err := normRange(in.Range)
+	if err != nil {
+		return nil, SearchTermsOut{}, err
+	}
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	out := SearchTermsOut{Site: s.Name, Range: rng, Rows: []searchconsole.Term{}}
+	if t.st.Search == nil {
+		return nil, out, nil
+	}
+	if _, err := t.st.Search.Get(ctx, s.ID); err != nil {
+		if errors.Is(err, searchconsole.ErrNotConnected) {
+			return nil, out, nil
+		}
+		return nil, out, err
+	}
+	out.Connected = true
+	from, to, _ := stats.Window(rng, t.st.Now())
+	rows, err := t.st.Search.Terms(ctx, s.ID, from.Format("2006-01-02"), to.Add(-time.Second).Format("2006-01-02"), limit)
+	if err != nil {
+		return nil, out, err
+	}
+	out.Rows = rows
+	return nil, out, nil
+}
+
+type RevenueIn struct {
+	Site  string `json:"site" jsonschema:"site id, name or domain"`
+	Range string `json:"range,omitempty" jsonschema:"24h, 48h, 7d, 30d, 90d or 180d; default 30d"`
+	Limit int    `json:"limit,omitempty" jsonschema:"rows per breakdown, 1-100, default 10"`
+}
+
+type RevenueOut struct {
+	Site               string                 `json:"site"`
+	Range              string                 `json:"range"`
+	Connected          bool                   `json:"connected"`
+	Currency           string                 `json:"currency" jsonschema:"ISO code; amounts are in its minor unit"`
+	Totals             polar.Totals           `json:"totals" jsonschema:"revenue is net of discounts, tax and refunds"`
+	Previous           polar.Totals           `json:"previous"`
+	DeltaPct           *float64               `json:"revenue_delta_pct"`
+	Visitors           int                    `json:"visitors" jsonschema:"daily-unique visitors over the same range, from the traffic rollups"`
+	RevenuePerVisitor  float64                `json:"revenue_per_visitor" jsonschema:"minor units per visitor; 0 when there were no visitors"`
+	AttributedOrders   int                    `json:"attributed_orders" jsonschema:"paid orders whose checkout carried first-touch attribution"`
+	UnattributedOrders int                    `json:"unattributed_orders" jsonschema:"paid orders with no attribution: direct buyers, or orders placed before the site passed attribution to checkout"`
+	Series             []polar.Point          `json:"series"`
+	Breakdowns         map[string][]polar.Row `json:"breakdowns" jsonschema:"keys ref, source, campaign, landing, country, product; the empty key is unattributed (see unattributed_orders)"`
+}
+
+func (t *tools) revenue(ctx context.Context, _ *sdk.CallToolRequest, in RevenueIn) (*sdk.CallToolResult, RevenueOut, error) {
+	s, err := t.resolve(ctx, in.Site)
+	if err != nil {
+		return nil, RevenueOut{}, err
+	}
+	if in.Range == "" {
+		in.Range = "30d"
+	}
+	rng, err := normRange(in.Range)
+	if err != nil {
+		return nil, RevenueOut{}, err
+	}
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 100 {
+		limit = 100
+	}
+	out := RevenueOut{Site: s.Name, Range: rng, Series: []polar.Point{}, Breakdowns: map[string][]polar.Row{}}
+	if t.st.Revenue == nil {
+		return nil, out, nil
+	}
+	if _, err := t.st.Revenue.Get(ctx, s.ID); err != nil {
+		if errors.Is(err, polar.ErrNotConnected) {
+			return nil, out, nil
+		}
+		return nil, out, err
+	}
+	out.Connected = true
+	from, to, bucket := stats.Window(rng, t.st.Now())
+	if out.Currency, err = t.st.Revenue.Currency(ctx, s.ID); err != nil {
+		return nil, out, err
+	}
+	if out.Series, err = t.st.Revenue.Series(ctx, s.ID, from, to, bucket); err != nil {
+		return nil, out, err
+	}
+	if out.Totals, err = t.st.Revenue.Totals(ctx, s.ID, from, to); err != nil {
+		return nil, out, err
+	}
+	if out.Previous, err = t.st.Revenue.Totals(ctx, s.ID, from.Add(-to.Sub(from)), from); err != nil {
+		return nil, out, err
+	}
+	out.DeltaPct = pct(out.Totals.Revenue, out.Previous.Revenue)
+	for _, dim := range polar.Dims {
+		if out.Breakdowns[dim], err = t.st.Revenue.Breakdown(ctx, s.ID, dim, from, to, limit); err != nil {
+			return nil, out, err
+		}
+	}
+	// Attributed versus not, read off the referrer breakdown without a limit.
+	if rows, err := t.st.Revenue.Breakdown(ctx, s.ID, "ref", from, to, 10000); err == nil {
+		for _, r := range rows {
+			if r.Key == "" {
+				out.UnattributedOrders += r.Orders
+			} else {
+				out.AttributedOrders += r.Orders
+			}
+		}
+	}
+	if sum, err := t.st.Stats.Summary(ctx, s.ID, rng, t.st.Now(), 1); err == nil {
+		out.Visitors = sum.Totals.Visitors
+		if out.Visitors > 0 {
+			out.RevenuePerVisitor = math.Round(float64(out.Totals.Revenue)/float64(out.Visitors)*100) / 100
+		}
+	}
+	return nil, out, nil
+}
+
+func (t *tools) filters(in map[string]string) stats.Filters {
+	f := stats.Filters{}
+	for dim, key := range in {
+		dim = strings.ToLower(strings.TrimSpace(dim))
+		if stats.ValidDim(dim) && key != "Other" {
+			f[dim] = key
+		}
+	}
+	return f
+}
+
+func (t *tools) retention(ctx context.Context) int {
+	if t.st.RetentionDays != nil {
+		return t.st.RetentionDays(ctx)
+	}
+	return 7
+}
+
+func boolPtr(b bool) *bool { return &b }
+
+// ---- funnel ----
+
+type FunnelIn struct {
+	Site   string `json:"site" jsonschema:"site id, name or domain"`
+	Funnel string `json:"funnel" jsonschema:"funnel id or name"`
+	Range  string `json:"range,omitempty" jsonschema:"24h, 48h, 7d, 30d, 90d or 180d; default 7d. Reads raw events, limited by retention"`
+}
+
+type FunnelOut struct {
+	Site   string         `json:"site"`
+	Funnel string         `json:"funnel"`
+	Range  string         `json:"range"`
+	Result funnels.Result `json:"result" jsonschema:"per-step visitors, rates and overall conversion"`
+}
+
+func (t *tools) funnel(ctx context.Context, _ *sdk.CallToolRequest, in FunnelIn) (*sdk.CallToolResult, FunnelOut, error) {
+	s, err := t.resolve(ctx, in.Site)
+	if err != nil {
+		return nil, FunnelOut{}, err
+	}
+	rng, err := normRange(in.Range)
+	if err != nil {
+		return nil, FunnelOut{}, err
+	}
+	if t.st.Funnels == nil {
+		return nil, FunnelOut{}, fmt.Errorf("funnels are not configured")
+	}
+	list, err := t.st.Funnels.List(ctx, s.ID)
+	if err != nil {
+		return nil, FunnelOut{}, err
+	}
+	want := strings.ToLower(strings.TrimSpace(in.Funnel))
+	var found *funnels.Funnel
+	for i := range list {
+		if strings.ToLower(list[i].ID) == want || strings.ToLower(list[i].Name) == want {
+			found = &list[i]
+			break
+		}
+	}
+	if found == nil {
+		return nil, FunnelOut{}, fmt.Errorf("no such funnel")
+	}
+	from, to, _ := stats.Window(rng, t.st.Now())
+	res, err := t.st.Funnels.Evaluate(ctx, s.ID, found.Steps, from, to)
+	if err != nil {
+		return nil, FunnelOut{}, err
+	}
+	return nil, FunnelOut{Site: s.Name, Funnel: found.Name, Range: rng, Result: res}, nil
+}
+
+// ---- journey ----
+
+type JourneyIn struct {
+	Site  string `json:"site" jsonschema:"site id, name or domain"`
+	Range string `json:"range,omitempty" jsonschema:"24h, 48h, 7d, 30d, 90d or 180d; default 7d. Reads raw events, limited by retention"`
+	Steps int    `json:"steps,omitempty" jsonschema:"pages per visit to follow, 2-7, default 4"`
+	Limit int    `json:"limit,omitempty" jsonschema:"paths and transitions returned, 1-100, default 20"`
+	Start string `json:"start,omitempty" jsonschema:"only visits whose first page is this path, e.g. /"`
+}
+
+type JourneyOut struct {
+	Site     string          `json:"site"`
+	Range    string          `json:"range"`
+	Journeys journeys.Report `json:"journeys"`
+}
+
+func (t *tools) journey(ctx context.Context, _ *sdk.CallToolRequest, in JourneyIn) (*sdk.CallToolResult, JourneyOut, error) {
+	s, err := t.resolve(ctx, in.Site)
+	if err != nil {
+		return nil, JourneyOut{}, err
+	}
+	rng, err := normRange(in.Range)
+	if err != nil {
+		return nil, JourneyOut{}, err
+	}
+	steps := in.Steps
+	if steps == 0 {
+		steps = 4
+	}
+	limit := in.Limit
+	if limit == 0 {
+		limit = 20
+	}
+	if t.st.Journeys == nil {
+		return nil, JourneyOut{}, fmt.Errorf("journeys are not configured")
+	}
+	from, to, _ := stats.Window(rng, t.st.Now())
+	res, err := t.st.Journeys.Report(ctx, s.ID, from, to, steps, limit, strings.TrimSpace(in.Start))
+	if err != nil {
+		return nil, JourneyOut{}, err
+	}
+	return nil, JourneyOut{Site: s.Name, Range: rng, Journeys: res}, nil
+}
+
+// ---- sessions ----
+type SessionsIn struct {
+	Site  string `json:"site" jsonschema:"site id, name or domain"`
+	Range string `json:"range,omitempty" jsonschema:"24h, 48h, 7d, 30d, 90d or 180d; default 7d. Reads raw events, limited by retention"`
+	Limit int    `json:"limit,omitempty" jsonschema:"1-500, default 100"`
+}
+
+type SessionsOut struct {
+	Site     string           `json:"site"`
+	Range    string           `json:"range"`
+	Sessions []stats.VisitRow `json:"sessions" jsonschema:"newest first"`
+}
+
+func (t *tools) sessions(ctx context.Context, _ *sdk.CallToolRequest, in SessionsIn) (*sdk.CallToolResult, SessionsOut, error) {
+	s, err := t.resolve(ctx, in.Site)
+	if err != nil {
+		return nil, SessionsOut{}, err
+	}
+	rng, err := normRange(in.Range)
+	if err != nil {
+		return nil, SessionsOut{}, err
+	}
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 100
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	from, to, _ := stats.Window(rng, t.st.Now())
+	rows, err := t.st.Stats.Sessions(ctx, s.ID, from, to, limit)
+	if err != nil {
+		return nil, SessionsOut{}, err
+	}
+	return nil, SessionsOut{Site: s.Name, Range: rng, Sessions: rows}, nil
+}
+
+// ---- vitals ----
+
+type VitalsIn struct {
+	Site  string `json:"site" jsonschema:"site id, name or domain"`
+	Range string `json:"range,omitempty" jsonschema:"24h, 48h, 7d, 30d, 90d or 180d; default 30d"`
+}
+
+type VitalsOut struct {
+	Site   string             `json:"site"`
+	Range  string             `json:"range"`
+	Vitals stats.VitalsReport `json:"vitals" jsonschema:"percentiles plus slowest paths by LCP p75"`
+}
+
+func (t *tools) vitals(ctx context.Context, _ *sdk.CallToolRequest, in VitalsIn) (*sdk.CallToolResult, VitalsOut, error) {
+	s, err := t.resolve(ctx, in.Site)
+	if err != nil {
+		return nil, VitalsOut{}, err
+	}
+	rng, err := normRange(in.Range)
+	if err != nil {
+		return nil, VitalsOut{}, err
+	}
+	from, to, _ := stats.Window(rng, t.st.Now())
+	rep, err := t.st.Stats.Vitals(ctx, s.ID, from, to)
+	if err != nil {
+		return nil, VitalsOut{}, err
+	}
+	return nil, VitalsOut{Site: s.Name, Range: rng, Vitals: rep}, nil
+}

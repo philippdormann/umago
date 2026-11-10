@@ -1,0 +1,21 @@
+services:
+  umago:
+    build:
+      context: ./server
+    image: ghcr.io/philippdormann/umago:latest
+    restart: unless-stopped
+    ports:
+      - "8082:8080"
+    volumes:
+      # The container runs as uid 1000. On Linux hosts run `mkdir -p data && chown 1000:1000 data` once.
+      - "./data:/data"
+    environment:
+      UMAGO_DATABASE_PATH: /data/umago.db
+      UMAGO_ADMIN_USER: ${UMAGO_ADMIN_USER:-admin}
+      UMAGO_ADMIN_PASSWORD: ${UMAGO_ADMIN_PASSWORD:-change-me-please}
+      UMAGO_LOG_LEVEL: ${UMAGO_LOG_LEVEL:-info}
+      UMAGO_RETENTION_DAYS: ${UMAGO_RETENTION_DAYS:-7}
+      UMAGO_MCP_TOKEN: ${UMAGO_MCP_TOKEN:-}
+      UMAGO_SCRIPT_NAMES: ${UMAGO_SCRIPT_NAMES:-}
+      UMAGO_GOOGLE_CLIENT_ID: ${UMAGO_GOOGLE_CLIENT_ID:-}
+      UMAGO_GOOGLE_CLIENT_SECRET: ${UMAGO_GOOGLE_CLIENT_SECRET:-}
