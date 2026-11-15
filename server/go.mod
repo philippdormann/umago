@@ -3,12 +3,12 @@ module github.com/philippdormann/umago/server
 go 1.27.4
 
 require (
-	github.com/jackc/pgx/v5 v5.12.0
+	github.com/jackc/pgx/v5 v5.13.0
 	github.com/maxmind/mmdbwriter v1.2.0
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/oschwald/geoip2-golang v1.13.0
 	github.com/pquerna/otp v1.5.0
-	golang.org/x/crypto v0.58.0
+	golang.org/x/crypto v0.59.0
 	modernc.org/sqlite v1.62.0
 )
 
