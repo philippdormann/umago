@@ -57,7 +57,9 @@ jobs:
         working-directory: server/web
         # Gate on high+ like the Trivy scan: lows with no in-range fix
         # (e.g. deepmerge via vite-plugin-svelte) must not break releases.
-        run: bun audit --audit-level=high
+        # GHSA-fc5q-39xc-vjpf / CVE-2026-112366 was revoked: it does not affect
+        # any version of picomatch. https://security.snyk.io/vuln/SNYK-JS-PICOMATCH-21248802
+        run: bun audit --audit-level=high --ignore GHSA-fc5q-39xc-vjpf
 
   trivy-fs:
     # Dependency gate on the repo itself: fails the run on any
